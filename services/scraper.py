@@ -1,5 +1,8 @@
-import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+from urllib.parse import quote
+
+import httpx
 
 # curl_cffi로 Chrome 흉내 → Yahoo Finance IP 차단 우회
 try:
@@ -9,6 +12,29 @@ except Exception:
     _SESSION = None
 
 import yfinance as yf
+
+
+def _fetch_google_news(query: str, max_items: int = 10) -> list[dict]:
+    """Google News RSS로 뉴스 수집 — 무제한, Cloudflare 없음"""
+    try:
+        url = (
+            f"https://news.google.com/rss/search"
+            f"?q={quote(query)}+stock"
+            f"&hl=en&gl=US&ceid=US:en"
+        )
+        r = httpx.get(url, timeout=10, follow_redirects=True,
+                      headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        items = []
+        for item in root.findall(".//item")[:max_items]:
+            title = item.findtext("title") or ""
+            link  = item.findtext("link") or "#"
+            if title:
+                items.append({"title": title, "link": link})
+        return items
+    except Exception:
+        return []
 
 
 def normalize_ticker(ticker: str) -> str:
@@ -50,26 +76,28 @@ def get_stock_data(ticker: str) -> dict:
     analyst_low    = full_info.get("targetLowPrice")
     analyst_high   = full_info.get("targetHighPrice")
 
-    # ── 2. 뉴스 ──────────────────────────────────────────
-    news_items = []
-    try:
-        raw_news = t.news or []
-        for n in raw_news[:8]:
-            content = n.get("content", {})
-            title = (
-                content.get("title")
-                or n.get("title", "")
-            )
-            # 링크: canonicalUrl > clickThroughUrl > 직접 link
-            link = (
-                (content.get("canonicalUrl") or {}).get("url")
-                or (content.get("clickThroughUrl") or {}).get("url")
-                or n.get("link", "#")
-            )
-            if title:
-                news_items.append({"title": title, "link": link})
-    except Exception:
-        pass
+    # ── 2. 뉴스 — Google News RSS (무제한, Cloudflare 없음) ──
+    # 종목명 + 티커로 검색해서 더 풍부한 결과
+    stock_name = full_info.get("longName") or full_info.get("shortName") or normalized
+    # 한국 주식이면 한국어로도 검색
+    base_ticker = normalized.replace(".KS", "").replace(".KQ", "")
+    news_items = _fetch_google_news(f"{base_ticker} {stock_name}", max_items=10)
+    # Google News 실패 시 yfinance 뉴스로 폴백
+    if not news_items:
+        try:
+            raw_news = t.news or []
+            for n in raw_news[:8]:
+                content = n.get("content", {})
+                title = content.get("title") or n.get("title", "")
+                link  = (
+                    (content.get("canonicalUrl") or {}).get("url")
+                    or (content.get("clickThroughUrl") or {}).get("url")
+                    or n.get("link", "#")
+                )
+                if title:
+                    news_items.append({"title": title, "link": link})
+        except Exception:
+            pass
 
     # ── 3. 차트 데이터 (최근 6개월 일봉) ─────────────────
     chart_data = []
