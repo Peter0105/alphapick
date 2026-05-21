@@ -177,11 +177,17 @@ function renderChart(chartData) {
 async function loadPortfolio() {
   try {
     const res = await fetch('/api/portfolio');
+    if (!res.ok) throw new Error(res.status);
     const p = await res.json();
     renderPortfolio(p);
   } catch (e) {
-    document.getElementById('portStats').innerHTML =
-      '<div class="port-stat"><div class="port-stat-label">상태</div><div class="port-stat-value" style="color:var(--red);font-size:14px">로딩 실패 — 새로고침</div></div>';
+    // 실패해도 UI는 유지, 에러 메시지만 업데이트
+    const el = document.getElementById('portStats');
+    if (el) el.innerHTML =
+      '<div class="port-stat"><div class="port-stat-label">상태</div>'
+      + '<div class="port-stat-value" style="color:var(--yellow);font-size:13px">서버 연결 중...</div></div>';
+    // 5초 후 재시도
+    setTimeout(loadPortfolio, 5000);
   }
 }
 
@@ -284,5 +290,9 @@ async function resetPortfolio() {
   document.getElementById('last-decision').classList.add('hidden');
 }
 
-// 초기 로드
+// 초기 로드 — 트레이딩 탭 기본 뼈대 먼저 그리고 데이터 로드
+renderPortfolio({
+  cash: 0, initial_cash: 10000000, total_value: 0,
+  return_pct: 0, positions: {}, trade_history: []
+});
 loadPortfolio();

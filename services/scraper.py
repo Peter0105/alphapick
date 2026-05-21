@@ -12,7 +12,6 @@ AV_BASE = "https://www.alphavantage.co/query"
 
 def normalize_ticker(ticker: str) -> str:
     ticker = ticker.strip().upper().replace(" ", "")
-    # 6자리 숫자 → 한국 주식
     if ticker.isdigit() and len(ticker) == 6:
         return f"{ticker}.KS"
     return ticker
@@ -31,7 +30,7 @@ def _get(params: dict, retries: int = 3) -> dict:
                 return data
         except Exception as e:
             if attempt < retries - 1:
-                time.sleep(2)
+                time.sleep(3)
             else:
                 raise e
     return {}
@@ -41,30 +40,25 @@ def get_stock_data(ticker: str) -> dict:
     normalized = normalize_ticker(ticker)
     av_symbol = normalized.replace(".KS", "").replace(".KQ", "")
 
-    # ── 1. 기본 정보 + 현재가 (OVERVIEW) ──────────────────
+    # ── 호출 1: OVERVIEW (펀더멘털 전체) ──────────────────
     overview = _get({"function": "OVERVIEW", "symbol": av_symbol})
-    if not overview or overview.get("Symbol") is None:
+    if not overview or not overview.get("Symbol"):
         raise ValueError(f"종목을 찾을 수 없습니다: {av_symbol}")
 
-    time.sleep(13)  # 분당 5회 제한 → 호출 간 13초 간격
+    time.sleep(15)  # 분당 5회 제한 — 15초 간격
 
-    # ── 2. 현재가 (GLOBAL_QUOTE) ───────────────────────────
-    quote_data = _get({"function": "GLOBAL_QUOTE", "symbol": av_symbol})
-    q = quote_data.get("Global Quote", {})
-    current_price = float(q.get("05. price", 0) or 0) or None
-
-    time.sleep(13)
-
-    # ── 3. 가격 히스토리 ───────────────────────────────────
+    # ── 호출 2: 일봉 차트 + 현재가 ────────────────────────
     chart_data = []
+    current_price = None
     try:
         hist = _get({
             "function": "TIME_SERIES_DAILY",
             "symbol": av_symbol,
-            "outputsize": "compact",
+            "outputsize": "compact",  # 최근 100일
         })
         series = hist.get("Time Series (Daily)", {})
-        for date_str in sorted(series.keys())[-100:]:
+        sorted_dates = sorted(series.keys())
+        for date_str in sorted_dates[-100:]:
             d = series[date_str]
             chart_data.append({
                 "date":   date_str,
@@ -74,27 +68,15 @@ def get_stock_data(ticker: str) -> dict:
                 "close":  round(float(d["4. close"]), 2),
                 "volume": int(d["5. volume"]),
             })
-    except Exception:
-        pass
-
-    time.sleep(13)
-
-    # ── 4. 뉴스 ────────────────────────────────────────────
-    news = []
-    try:
-        news_data = _get({
-            "function": "NEWS_SENTIMENT",
-            "tickers": av_symbol,
-            "limit": "5",
-        })
-        for item in news_data.get("feed", [])[:5]:
-            news.append({"title": item.get("title", ""), "link": item.get("url", "")})
+        # 가장 최근 종가 = 현재가
+        if sorted_dates:
+            current_price = float(series[sorted_dates[-1]]["4. close"])
     except Exception:
         pass
 
     def flt(val):
         try:
-            return float(val) if val and val != "None" else None
+            return float(val) if val and val not in ("None", "-") else None
         except Exception:
             return None
 
@@ -115,13 +97,13 @@ def get_stock_data(ticker: str) -> dict:
         "ma_200":         flt(overview.get("200DayMovingAverage")),
         "beta":           flt(overview.get("Beta")),
         "dividend_yield": flt(overview.get("DividendYield")),
-        "volume":         int(q.get("06. volume", 0) or 0) or None,
+        "volume":         None,
         "avg_volume":     None,
         "sector":         overview.get("Sector"),
         "industry":       overview.get("Industry"),
         "analyst_target": flt(overview.get("AnalystTargetPrice")),
         "analyst_low":    None,
         "analyst_high":   None,
-        "news":           news,
+        "news":           [],  # API 호출 절약 — 뉴스 제거
         "chart_data":     chart_data,
     }
