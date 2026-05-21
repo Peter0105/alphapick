@@ -1,14 +1,14 @@
 """
 AlphaPick Auto Trading Router
-백테스트 검증된 MA 교차 전략 기반 규칙 매매
-(Claude API는 시장 코멘트에만 사용 — 매매 결정은 순수 알고리즘)
+백테스트 1위 전략: 파라볼릭 SAR
+(20전략 × 워크포워드 검증 결과 — 총수익 +119%, OOS평균 +14.3%)
 """
 
 import json
 import pandas as pd
 from fastapi import APIRouter
 from services.portfolio import load_portfolio, reset_portfolio, execute_trade, update_prices
-from services.strategy  import strat_bollinger_rev, add_indicators
+from services.strategy  import strat_parabolic_sar, add_indicators
 from services.scraper   import get_stock_data
 
 router = APIRouter()
@@ -63,7 +63,7 @@ def _get_signal(ticker: str) -> dict:
         if len(df) < 55:
             return {"signal": 0, "price": float(closes[-1]) if closes else None}
 
-        df     = strat_bollinger_rev(df)
+        df     = strat_parabolic_sar(df)
         last   = df.iloc[-1]
         signal = int(last.get("signal", 0))
         price  = float(last["close"])
@@ -71,10 +71,8 @@ def _get_signal(ticker: str) -> dict:
         return {
             "signal":    signal,
             "price":     price,
-            "bb_upper":  float(last["bb_upper"]) if pd.notna(last.get("bb_upper")) else None,
-            "bb_lower":  float(last["bb_lower"]) if pd.notna(last.get("bb_lower")) else None,
-            "bb_pct":    float(last["bb_pct"])   if pd.notna(last.get("bb_pct"))   else None,
-            "rsi":       float(last["rsi"])       if pd.notna(last.get("rsi"))      else None,
+            "sar":       float(last["sar"]) if pd.notna(last.get("sar")) else None,
+            "rsi":       float(last["rsi"]) if pd.notna(last.get("rsi")) else None,
         }
     except Exception as e:
         return {"signal": 0, "price": None}
@@ -133,10 +131,9 @@ async def auto_trade():
             qty    = int(invest / price)
             if qty < 1:
                 continue
-            bb_l = sig.get("bb_lower")
-            bb_u = sig.get("bb_upper")
-            reason_buy = (f"볼린저 하단 반등 (BB하단={bb_l:.2f}, BB상단={bb_u:.2f})"
-                          if bb_l else "볼린저 하단 반등")
+            sar_val = sig.get("sar")
+            reason_buy = (f"파라볼릭SAR 상향 돌파 (SAR={sar_val:.2f})"
+                          if sar_val else "파라볼릭SAR 매수 신호")
             result = execute_trade("BUY", ticker, qty, price, reason_buy)
             if result["success"]:
                 cash -= qty * price
@@ -144,7 +141,7 @@ async def auto_trade():
                 trade_log.append({
                     "action": "BUY", "ticker": ticker,
                     "quantity": qty, "price": price,
-                    "reason": "볼린저 하단 반등",
+                    "reason": reason_buy,
                     "result": result,
                 })
 
@@ -152,8 +149,8 @@ async def auto_trade():
             pos = portfolio["positions"].get(ticker)
             if not pos:
                 continue
-            bb_u = sig.get("bb_upper")
-            reason_sell = (f"볼린저 상단 하락 (BB상단={bb_u:.2f})" if bb_u else "볼린저 상단 하락")
+            sar_val = sig.get("sar")
+            reason_sell = (f"파라볼릭SAR 하향 이탈 (SAR={sar_val:.2f})" if sar_val else "파라볼릭SAR 매도 신호")
             result = execute_trade("SELL", ticker, pos["quantity"], price, reason_sell)
             if result["success"]:
                 trade_log.append({
@@ -169,7 +166,7 @@ async def auto_trade():
     return {
         "decision": {
             "market_view": market_view,
-            "strategy":    "볼린저 밴드 역추세 (백테스트 4년 +91.2%, 샤프 1.09, 승률 60%)",
+            "strategy":    "파라볼릭 SAR 🏆 1위 (20전략 백테스트 5년 +119%, OOS검증 +14.3%)",
         },
         "executed":  trade_log,
         "portfolio": load_portfolio(),
@@ -179,11 +176,11 @@ async def auto_trade():
 def _get_market_comment(signals: dict, portfolio: dict) -> str:
     try:
         from services.claude_service import _get_client
-        oversold  = [t for t, s in signals.items() if (s.get("bb_pct") or 1) < 0.2]
-        overbought= [t for t, s in signals.items() if (s.get("bb_pct") or 0) > 0.8]
+        above_sar = [t for t, s in signals.items() if s.get("sar") and s.get("price", 0) > s.get("sar", 0)]
+        below_sar = [t for t, s in signals.items() if s.get("sar") and s.get("price", 0) < s.get("sar", 0)]
         prompt = (
-            f"볼린저 밴드 과매도(하단 근접) 종목: {oversold}\n"
-            f"볼린저 밴드 과매수(상단 근접) 종목: {overbought}\n"
+            f"파라볼릭SAR 위(상승추세): {above_sar}\n"
+            f"파라볼릭SAR 아래(하락추세): {below_sar}\n"
             f"포트폴리오 수익률: {portfolio.get('return_pct', 0):.2f}%\n"
             "위 상황을 한 문장으로 요약해줘."
         )
