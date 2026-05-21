@@ -175,9 +175,14 @@ function renderChart(chartData) {
 
 // ── PORTFOLIO ──────────────────────────────────────
 async function loadPortfolio() {
-  const res = await fetch('/api/portfolio');
-  const p = await res.json();
-  renderPortfolio(p);
+  try {
+    const res = await fetch('/api/portfolio');
+    const p = await res.json();
+    renderPortfolio(p);
+  } catch (e) {
+    document.getElementById('portStats').innerHTML =
+      '<div class="port-stat"><div class="port-stat-label">상태</div><div class="port-stat-value" style="color:var(--red);font-size:14px">로딩 실패 — 새로고침</div></div>';
+  }
 }
 
 function renderPortfolio(p) {

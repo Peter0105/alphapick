@@ -1,21 +1,5 @@
 import yfinance as yf
-import requests
 import time
-
-
-def _make_session() -> requests.Session:
-    """클라우드 서버 IP 차단 우회용 세션"""
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    })
-    return s
 
 
 def normalize_ticker(ticker: str) -> str:
@@ -31,13 +15,12 @@ def get_stock_data(ticker: str, retries: int = 3) -> dict:
     last_err = None
     for attempt in range(retries):
         try:
-            session = _make_session()
-            stock = yf.Ticker(normalized, session=session)
+            # yfinance 1.3+ : session 직접 넘기지 않음 (curl_cffi 내부 사용)
+            stock = yf.Ticker(normalized)
             info = stock.info
 
-            # info가 비어있으면 실패로 간주
-            if not info or info.get("trailingPegRatio") is None and not info.get("shortName"):
-                raise ValueError("빈 응답 — 티커를 찾을 수 없거나 레이트 리밋")
+            if not info or not info.get("shortName"):
+                raise ValueError("종목 정보를 찾을 수 없습니다")
 
             hist = stock.history(period="6mo")
 
@@ -98,7 +81,7 @@ def get_stock_data(ticker: str, retries: int = 3) -> dict:
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
-                time.sleep(2 + attempt * 2)  # 2s, 4s 대기 후 재시도
+                time.sleep(2)
             continue
 
     raise RuntimeError(f"데이터 수집 실패 ({retries}회 시도): {last_err}")
