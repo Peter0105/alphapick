@@ -1,6 +1,7 @@
 """
-AlphaPick — 20가지 트레이딩 전략
+AlphaPick — 30가지 트레이딩 전략
 signal: +1 매수 / -1 매도 / 0 홀드
+전략 21~30: 8주 차트 교육 기반 (지지저항·SR플립·거래량·캔들·MA정배열·패턴)
 """
 
 import pandas as pd
@@ -386,7 +387,262 @@ def strat_volatility_breakout(df):
 
 
 # ══════════════════════════════════════════════════════════════
-#  전략 딕셔너리 (20개)
+#  8주 차트 교육 기반 전략 (21~30)
+# ══════════════════════════════════════════════════════════════
+
+# ── 전략 21: SR 플립 (지지→저항 전환 후 리테스트) ─────────────
+# 핵심 개념: 돌파 → 전 저항이 지지로 전환 → 풀백 후 반등 매수
+def strat_sr_flip(df):
+    df = add_indicators(df); df["signal"] = 0
+    # 3일 전 돈치안 고점(저항선)
+    prev_res = df["don_high"].shift(3)
+    # 3일 전에 저항을 돌파했는가
+    broke_out = df["close"].shift(3) > df["don_high"].shift(4)
+    # 지금 전 저항 부근까지 풀백(±2%)
+    at_sr = ((df["close"] >= prev_res * 0.97) & (df["close"] <= prev_res * 1.03))
+    # 거래량 조건: 바닥 확인(거래량 축소 풀백)
+    low_vol_pullback = df["volume"] < df["volume"].rolling(20).mean() * 1.2
+    buy = broke_out & at_sr & low_vol_pullback & (df["rsi"] > 38) & (df["rsi"] < 65)
+    df.loc[buy & ~buy.shift(1).fillna(False), "signal"] = 1
+    # 매도: 20일 최저가 이탈
+    df.loc[df["close"] < df["don_low"].shift(1), "signal"] = -1
+    return df
+
+
+# ── 전략 22: 거래량 확인 돌파 (Volume-Confirmed Breakout) ──────
+# 핵심 개념: 진짜 돌파 = 가격 + 거래량 동시 폭발 (1.5× 평균)
+def strat_volume_breakout(df):
+    df = add_indicators(df); df["signal"] = 0
+    vol_ma   = df["volume"].rolling(20).mean()
+    high_vol = df["volume"] > vol_ma * 1.5     # 거래량 1.5배 이상
+    # 20일 고점 / 저점 돌파
+    broke_up = (df["close"] > df["don_high"].shift(1)) & high_vol & (df["close"] > df["ma20"])
+    broke_dn = (df["close"] < df["don_low"].shift(1))  & high_vol & (df["close"] < df["ma20"])
+    df.loc[broke_up & ~broke_up.shift(1).fillna(False), "signal"] =  1
+    df.loc[broke_dn & ~broke_dn.shift(1).fillna(False), "signal"] = -1
+    return df
+
+
+# ── 전략 23: 캔들 패턴 + 지지저항 컨플루언스 ────────────────────
+# 핵심 개념: 핀바·엔걸핑은 반드시 주요 지지저항 위에서만 유효
+def strat_candlestick_confluence(df):
+    df = add_indicators(df); df["signal"] = 0
+    body_size  = (df["close"] - df["open"]).abs()
+    avg_body   = body_size.rolling(14).mean()
+    lower_wick = df[["open", "close"]].min(axis=1) - df["low"]
+    upper_wick = df["high"] - df[["open", "close"]].max(axis=1)
+
+    # 강세 핀바: 긴 아래꼬리(≥2× 몸통), 위꼬리 짧음
+    bull_pin = (lower_wick >= body_size * 2) & (lower_wick > upper_wick * 2) & (df["close"] >= df["open"])
+    # 강세 엔걸핑: 오늘 양봉이 전일 음봉 전체를 감싼다
+    bull_eng = ((df["close"] > df["open"]) &
+                (df["open"].shift(1) > df["close"].shift(1)) &
+                (df["close"] > df["open"].shift(1)) &
+                (df["open"] < df["close"].shift(1)))
+    # 주요 지지선 부근(±3%): MA20, MA50, 20일 저점
+    near_sup = (((df["close"] - df["ma20"]).abs() / df["ma20"] < 0.03) |
+                ((df["close"] - df["ma50"]).abs() / df["ma50"] < 0.03) |
+                ((df["close"] - df["don_low"]).abs() / df["don_low"] < 0.03))
+
+    # 약세 핀바 / 엔걸핑
+    bear_pin = (upper_wick >= body_size * 2) & (upper_wick > lower_wick * 2) & (df["close"] <= df["open"])
+    bear_eng = ((df["close"] < df["open"]) &
+                (df["open"].shift(1) < df["close"].shift(1)) &
+                (df["close"] < df["open"].shift(1)) &
+                (df["open"] > df["close"].shift(1)))
+    near_res = (((df["close"] - df["ma20"]).abs() / df["ma20"] < 0.03) |
+                ((df["close"] - df["don_high"]).abs() / df["don_high"] < 0.03))
+
+    buy  = (bull_pin | bull_eng) & near_sup & (df["rsi"] > 35) & (df["rsi"] < 65)
+    sell = (bear_pin | bear_eng) & near_res & (df["rsi"] > 50)
+    df.loc[buy  & ~buy.shift(1).fillna(False),  "signal"] =  1
+    df.loc[sell & ~sell.shift(1).fillna(False),  "signal"] = -1
+    return df
+
+
+# ── 전략 24: MA 정배열/역배열 ────────────────────────────────
+# 핵심 개념: 5>20>50>200 완전 정배열 → 가장 강한 상승 추세
+def strat_ma_alignment(df):
+    df = add_indicators(df); df["signal"] = 0
+    # 완전 정배열: 단기 → 장기 순서
+    bull_align = ((df["ma5"]  > df["ma20"]) &
+                  (df["ma20"] > df["ma50"]) &
+                  (df["ma50"] > df["ma200"]))
+    # 완전 역배열
+    bear_align = ((df["ma5"]  < df["ma20"]) &
+                  (df["ma20"] < df["ma50"]) &
+                  (df["ma50"] < df["ma200"]))
+    prev_bull = bull_align.shift(1).fillna(False)
+    prev_bear = bear_align.shift(1).fillna(False)
+    df.loc[bull_align & ~prev_bull, "signal"] =  1   # 정배열 전환
+    df.loc[bear_align & ~prev_bear, "signal"] = -1   # 역배열 전환
+    return df
+
+
+# ── 전략 25: 이중 바닥/천장 패턴 ────────────────────────────
+# 핵심 개념: W/M 패턴 — 두 번 테스트 후 돌파
+def strat_double_pattern(df):
+    df = add_indicators(df); df["signal"] = 0
+    # 이중 바닥(W): 최근 20일 최저가와 현재 저가가 비슷(±3%), RSI 반등
+    recent_low  = df["low"].rolling(20).min().shift(5)
+    cur_low_pct = (df["low"] - recent_low).abs() / recent_low
+    double_bot  = ((cur_low_pct < 0.03) &
+                   (df["low"] < df["ma50"]) &
+                   (df["rsi"] < 50) &
+                   (df["rsi"] > df["rsi"].shift(1)) &   # RSI 반등
+                   (df["close"] > df["close"].shift(1)))
+
+    # 이중 천장(M): 최근 20일 최고가와 현재 고가가 비슷(±3%), RSI 하락
+    recent_high = df["high"].rolling(20).max().shift(5)
+    cur_high_pct= (df["high"] - recent_high).abs() / recent_high
+    double_top  = ((cur_high_pct < 0.03) &
+                   (df["high"] > df["ma50"]) &
+                   (df["rsi"] > 55) &
+                   (df["rsi"] < df["rsi"].shift(1)) &   # RSI 하락
+                   (df["close"] < df["close"].shift(1)))
+
+    df.loc[double_bot & ~double_bot.shift(1).fillna(False), "signal"] =  1
+    df.loc[double_top & ~double_top.shift(1).fillna(False), "signal"] = -1
+    return df
+
+
+# ── 전략 26: 매물대 (Volume Profile / VWAP 기반) ─────────────
+# 핵심 개념: 50일 누적 VWAP = POC 근사치 → 가격 > POC면 강세 지지
+def strat_volume_profile(df):
+    df = add_indicators(df); df["signal"] = 0
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    # 50일 롤링 VWAP (POC 근사)
+    df["vwap50"] = ((tp * df["volume"]).rolling(50).sum() /
+                    df["volume"].rolling(50).sum())
+    above = df["close"] > df["vwap50"]
+    prev  = above.shift(1).fillna(False)
+    # VWAP 위로 교차 + MA 정배열 확인
+    df.loc[ above & ~prev & (df["ma20"] > df["ma50"]), "signal"] =  1
+    df.loc[~above &  prev & (df["ma20"] < df["ma50"]), "signal"] = -1
+    return df
+
+
+# ── 전략 27: 모닝스타/이브닝스타 ──────────────────────────────
+# 핵심 개념: 3봉 반전 패턴 — 큰 음봉 → 도지 → 큰 양봉
+def strat_morning_evening_star(df):
+    df = add_indicators(df); df["signal"] = 0
+    body     = (df["close"] - df["open"]).abs()
+    avg_body = body.rolling(14).mean()
+
+    # 모닝스타 (바닥 반전): 음봉 → 도지 → 양봉
+    d1_bear  = (df["open"].shift(2) - df["close"].shift(2)) > avg_body.shift(2) * 0.6
+    d2_doji  = body.shift(1) < avg_body.shift(1) * 0.45
+    d3_bull  = (df["close"] - df["open"]) > avg_body * 0.6
+    morn     = d1_bear & d2_doji & d3_bull & (df["rsi"] < 55)
+
+    # 이브닝스타 (천장 반전): 양봉 → 도지 → 음봉
+    d1_bull2 = (df["close"].shift(2) - df["open"].shift(2)) > avg_body.shift(2) * 0.6
+    d3_bear2 = (df["open"] - df["close"]) > avg_body * 0.6
+    even     = d1_bull2 & d2_doji & d3_bear2 & (df["rsi"] > 50)
+
+    df.loc[morn & ~morn.shift(1).fillna(False), "signal"] =  1
+    df.loc[even & ~even.shift(1).fillna(False), "signal"] = -1
+    return df
+
+
+# ── 전략 28: 추세선 돌파 (고저점 연결선 기울기) ───────────────
+# 핵심 개념: 3개 고저점 추세선 → 돌파 + 거래량 확인 → 진입
+def strat_trendline_breakout(df):
+    df = add_indicators(df); df["signal"] = 0
+    # 상승 추세 (더 높은 저점): low[i] > low[i-5] > low[i-10]
+    higher_lows = ((df["low"] > df["low"].shift(5)) &
+                   (df["low"].shift(5) > df["low"].shift(10)))
+    # 하락 추세 (더 낮은 고점): high[i] < high[i-5] < high[i-10]
+    lower_highs = ((df["high"] < df["high"].shift(5)) &
+                   (df["high"].shift(5) < df["high"].shift(10)))
+
+    last_high = df["high"].rolling(10).max().shift(1)
+    last_low  = df["low"].rolling(10).min().shift(1)
+    vol_surge = df["volume"] > df["volume"].rolling(20).mean() * 1.3
+
+    # 상승 추세 중 전고점 돌파 + 거래량 확인
+    bull_break = higher_lows & (df["close"] > last_high) & vol_surge
+    # 하락 추세 중 전저점 이탈
+    bear_break = lower_highs & (df["close"] < last_low)
+
+    df.loc[bull_break & ~bull_break.shift(1).fillna(False), "signal"] =  1
+    df.loc[bear_break & ~bear_break.shift(1).fillna(False), "signal"] = -1
+    return df
+
+
+# ── 전략 29: 헤드앤숄더 패턴 ─────────────────────────────────
+# 핵심 개념: 3봉우리(왼어깨<머리>오른어깨) → 넥라인 이탈
+def strat_head_shoulders(df):
+    df = add_indicators(df); df["signal"] = 0
+    # 역 헤드앤숄더 (바닥 반전, 매수)
+    ls_low  = df["low"].rolling(5).min().shift(20)   # 왼 어깨 저점
+    head_l  = df["low"].rolling(5).min().shift(10)   # 머리 저점 (가장 낮음)
+    rs_low  = df["low"].rolling(5).min().shift(2)    # 오른 어깨 저점
+    ihs_pat = ((head_l < ls_low * 0.98) &
+               (head_l < rs_low * 0.98) &
+               ((ls_low - rs_low).abs() / ls_low < 0.05))
+    neckline_h = df["high"].rolling(20).max().shift(1)
+    ihs_break  = ihs_pat.shift(2) & (df["close"] > neckline_h) & (df["rsi"] > 45)
+
+    # 정 헤드앤숄더 (천장 반전, 매도)
+    ls_high = df["high"].rolling(5).max().shift(20)
+    head_h  = df["high"].rolling(5).max().shift(10)
+    rs_high = df["high"].rolling(5).max().shift(2)
+    hs_pat  = ((head_h > ls_high * 1.02) &
+               (head_h > rs_high * 1.02) &
+               ((ls_high - rs_high).abs() / ls_high < 0.05))
+    neckline_l = df["low"].rolling(20).min().shift(1)
+    hs_break   = hs_pat.shift(2) & (df["close"] < neckline_l) & (df["rsi"] < 55)
+
+    df.loc[ihs_break, "signal"] =  1
+    df.loc[hs_break,  "signal"] = -1
+    return df
+
+
+# ── 전략 30: 종합 컨플루언스 스코어 ─────────────────────────
+# 핵심 개념: MA정배열+거래량+RSI+SAR+MACD+지지저항 모두 일치 시 진입
+def strat_confluence_score(df):
+    df = add_indicators(df); df["signal"] = 0
+    vol_ma = df["volume"].rolling(20).mean()
+
+    # 각 지표 점수 (+1 강세 / -1 약세)
+    # 1. MA 정배열
+    s_ma = pd.Series(np.where((df["ma5"]>df["ma20"]) & (df["ma20"]>df["ma50"]), 1,
+                     np.where((df["ma5"]<df["ma20"]) & (df["ma20"]<df["ma50"]), -1, 0)),
+                     index=df.index)
+    # 2. 거래량 방향
+    s_vol = pd.Series(np.where(
+        (df["volume"] > vol_ma * 1.2) & (df["close"] > df["close"].shift(1)),  1,
+        np.where(
+        (df["volume"] > vol_ma * 1.2) & (df["close"] < df["close"].shift(1)), -1, 0)),
+        index=df.index)
+    # 3. RSI 방향
+    s_rsi = pd.Series(np.where((df["rsi"] > 45) & (df["rsi"] < 65), 1,
+                      np.where((df["rsi"] > 55) & (df["rsi"] > df["rsi"].shift(1)), -1, 0)),
+                      index=df.index)
+    # 4. 가격 vs 주요 MA
+    s_price = pd.Series(np.where(df["close"] > df["ma200"],  1,
+                        np.where(df["close"] < df["ma200"], -1, 0)),
+                        index=df.index)
+    # 5. MACD
+    s_macd = pd.Series(np.where(df["macd"] > df["macd_sig"],  1,
+                       np.where(df["macd"] < df["macd_sig"], -1, 0)),
+                       index=df.index)
+    # 6. 파라볼릭 SAR
+    s_sar = pd.Series(np.where(df["close"] > df["sar"],  1,
+                      np.where(df["close"] < df["sar"], -1, 0)),
+                      index=df.index)
+
+    total = s_ma + s_vol + s_rsi + s_price + s_macd + s_sar   # 최대 ±6
+
+    prev_total = total.shift(1).fillna(0)
+    df.loc[(total >= 4) & (prev_total < 4),  "signal"] =  1   # 4개 이상 일치 → 매수
+    df.loc[(total <= -4) & (prev_total > -4), "signal"] = -1   # 4개 이상 역방향 → 매도
+    return df
+
+
+# ══════════════════════════════════════════════════════════════
+#  전략 딕셔너리 (30개)
 # ══════════════════════════════════════════════════════════════
 STRATEGIES = {
     # ── 기존 10 ──
@@ -400,7 +656,7 @@ STRATEGIES = {
     " 8.스토캐스틱":              strat_stochastic,
     " 9.OBV모멘텀":              strat_obv,
     "10.앙상블(5지표)":          strat_ensemble,
-    # ── 신규 10 ──
+    # ── 기술전략 10 ──
     "11.터틀(돈치안20)":         strat_turtle,
     "12.파라볼릭SAR":            strat_parabolic_sar,
     "13.ADX+MA":                strat_adx_ma,
@@ -411,4 +667,15 @@ STRATEGIES = {
     "18.듀얼모멘텀":             strat_dual_momentum,
     "19.트리플스크린(엘더)":     strat_triple_screen,
     "20.변동성돌파(LW)":         strat_volatility_breakout,
+    # ── 8주 교육 기반 신규 10 ──
+    "21.SR플립(리테스트)":       strat_sr_flip,
+    "22.거래량확인돌파":          strat_volume_breakout,
+    "23.캔들+지지저항":           strat_candlestick_confluence,
+    "24.MA정배열/역배열":         strat_ma_alignment,
+    "25.이중바닥/천장":           strat_double_pattern,
+    "26.매물대(VWAP50)":         strat_volume_profile,
+    "27.모닝/이브닝스타":         strat_morning_evening_star,
+    "28.추세선돌파":              strat_trendline_breakout,
+    "29.헤드앤숄더":              strat_head_shoulders,
+    "30.종합컨플루언스":          strat_confluence_score,
 }
