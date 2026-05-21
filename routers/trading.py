@@ -8,7 +8,7 @@ import json
 import pandas as pd
 from fastapi import APIRouter
 from services.portfolio import load_portfolio, reset_portfolio, execute_trade, update_prices
-from services.strategy  import strategy_ma_crossover, _add_indicators
+from services.strategy  import strat_bollinger_rev, add_indicators
 from services.scraper   import get_stock_data
 
 router = APIRouter()
@@ -63,19 +63,18 @@ def _get_signal(ticker: str) -> dict:
         if len(df) < 55:
             return {"signal": 0, "price": float(closes[-1]) if closes else None}
 
-        df      = strategy_ma_crossover(df)
-        last    = df.iloc[-1]
-        signal  = int(last.get("signal", 0))
-        price   = float(last["close"])
-        ma20    = float(last["ma20"])  if pd.notna(last.get("ma20"))  else None
-        ma50    = float(last["ma50"])  if pd.notna(last.get("ma50"))  else None
+        df     = strat_bollinger_rev(df)
+        last   = df.iloc[-1]
+        signal = int(last.get("signal", 0))
+        price  = float(last["close"])
 
         return {
-            "signal":  signal,
-            "price":   price,
-            "ma20":    ma20,
-            "ma50":    ma50,
-            "rsi":     float(last["rsi"]) if pd.notna(last.get("rsi")) else None,
+            "signal":    signal,
+            "price":     price,
+            "bb_upper":  float(last["bb_upper"]) if pd.notna(last.get("bb_upper")) else None,
+            "bb_lower":  float(last["bb_lower"]) if pd.notna(last.get("bb_lower")) else None,
+            "bb_pct":    float(last["bb_pct"])   if pd.notna(last.get("bb_pct"))   else None,
+            "rsi":       float(last["rsi"])       if pd.notna(last.get("rsi"))      else None,
         }
     except Exception as e:
         return {"signal": 0, "price": None}
@@ -134,15 +133,18 @@ async def auto_trade():
             qty    = int(invest / price)
             if qty < 1:
                 continue
-            result = execute_trade("BUY", ticker, qty, price,
-                                   f"MA 골든크로스 (MA20={ma20:.2f} > MA50={ma50:.2f})")
+            bb_l = sig.get("bb_lower")
+            bb_u = sig.get("bb_upper")
+            reason_buy = (f"볼린저 하단 반등 (BB하단={bb_l:.2f}, BB상단={bb_u:.2f})"
+                          if bb_l else "볼린저 하단 반등")
+            result = execute_trade("BUY", ticker, qty, price, reason_buy)
             if result["success"]:
                 cash -= qty * price
                 positions[ticker] = True
                 trade_log.append({
                     "action": "BUY", "ticker": ticker,
                     "quantity": qty, "price": price,
-                    "reason": f"MA 골든크로스",
+                    "reason": "볼린저 하단 반등",
                     "result": result,
                 })
 
@@ -150,8 +152,9 @@ async def auto_trade():
             pos = portfolio["positions"].get(ticker)
             if not pos:
                 continue
-            result = execute_trade("SELL", ticker, pos["quantity"], price,
-                                   f"MA 데드크로스 (MA20={ma20:.2f} < MA50={ma50:.2f})")
+            bb_u = sig.get("bb_upper")
+            reason_sell = (f"볼린저 상단 하락 (BB상단={bb_u:.2f})" if bb_u else "볼린저 상단 하락")
+            result = execute_trade("SELL", ticker, pos["quantity"], price, reason_sell)
             if result["success"]:
                 trade_log.append({
                     "action": "SELL", "ticker": ticker,
@@ -166,7 +169,7 @@ async def auto_trade():
     return {
         "decision": {
             "market_view": market_view,
-            "strategy":    "MA 교차 전략 (백테스트 검증 — 3년 +26.7%, 샤프 0.52)",
+            "strategy":    "볼린저 밴드 역추세 (백테스트 4년 +91.2%, 샤프 1.09, 승률 60%)",
         },
         "executed":  trade_log,
         "portfolio": load_portfolio(),
@@ -176,11 +179,11 @@ async def auto_trade():
 def _get_market_comment(signals: dict, portfolio: dict) -> str:
     try:
         from services.claude_service import _get_client
-        bull = [t for t, s in signals.items() if (s.get("ma20") or 0) > (s.get("ma50") or 0)]
-        bear = [t for t, s in signals.items() if (s.get("ma20") or 0) < (s.get("ma50") or 0)]
+        oversold  = [t for t, s in signals.items() if (s.get("bb_pct") or 1) < 0.2]
+        overbought= [t for t, s in signals.items() if (s.get("bb_pct") or 0) > 0.8]
         prompt = (
-            f"현재 MA20>MA50 종목: {bull}\n"
-            f"현재 MA20<MA50 종목: {bear}\n"
+            f"볼린저 밴드 과매도(하단 근접) 종목: {oversold}\n"
+            f"볼린저 밴드 과매수(상단 근접) 종목: {overbought}\n"
             f"포트폴리오 수익률: {portfolio.get('return_pct', 0):.2f}%\n"
             "위 상황을 한 문장으로 요약해줘."
         )
