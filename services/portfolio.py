@@ -1,8 +1,11 @@
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 
-PORTFOLIO_FILE = "data/portfolio.json"
+# 어떤 환경에서 실행해도 프로젝트 루트 기준으로 절대경로 사용
+_ROOT = Path(__file__).resolve().parent.parent
+PORTFOLIO_FILE = str(_ROOT / "data" / "portfolio.json")
 INITIAL_CASH = 10_000_000
 
 

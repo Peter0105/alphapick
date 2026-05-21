@@ -3,10 +3,12 @@ from pydantic import BaseModel
 from services.scraper import get_stock_data
 from services.claude_service import analyze_stock
 from datetime import date
+from pathlib import Path
 import json, os
 
 router = APIRouter()
-CACHE_FILE = "data/analysis_cache.json"
+_ROOT = Path(__file__).resolve().parent.parent
+CACHE_FILE = str(_ROOT / "data" / "analysis_cache.json")
 
 
 def _load_cache() -> dict:
