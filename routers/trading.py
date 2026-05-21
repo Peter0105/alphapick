@@ -29,22 +29,60 @@ async def do_reset():
 
 # ── 전략 신호 계산 ─────────────────────────────────────────
 
-def _get_signal(ticker: str) -> dict:
-    """Yahoo Finance에서 1년치 데이터 받아 MA 교차 신호 계산"""
+def _fetch_ohlcv(ticker: str, range_: str = "1y") -> list | None:
+    """Yahoo Finance OHLCV 가져오기 — query1(curl_cffi) → query2(httpx) 폴백"""
+    import httpx as _httpx
+    from datetime import datetime as _dt
+
+    def _parse_yf_result(result):
+        if not result:
+            return None
+        res   = result[0]
+        ts    = res.get("timestamp", [])
+        ohlcv = res.get("indicators", {}).get("quote", [{}])[0]
+        return ts, ohlcv
+
+    # 1차: curl_cffi Chrome 세션
     try:
         from curl_cffi import requests as cr
-        from datetime import datetime, timedelta
-
         session = cr.Session(impersonate="chrome124")
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        r   = session.get(url, params={"interval": "1d", "range": "1y"}, timeout=15)
+        r   = session.get(url, params={"interval": "1d", "range": range_}, timeout=15)
         result = r.json().get("chart", {}).get("result", [])
-        if not result:
+        parsed = _parse_yf_result(result)
+        if parsed:
+            return parsed
+    except Exception:
+        pass
+
+    # 2차: 일반 httpx (query2 엔드포인트)
+    try:
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Referer": "https://finance.yahoo.com/",
+        }
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+        r   = _httpx.get(url, params={"interval": "1d", "range": range_},
+                         headers=hdrs, timeout=15, follow_redirects=True)
+        result = r.json().get("chart", {}).get("result", [])
+        parsed = _parse_yf_result(result)
+        if parsed:
+            return parsed
+    except Exception:
+        pass
+
+    return None
+
+
+def _get_signal(ticker: str) -> dict:
+    """Yahoo Finance에서 1년치 데이터 받아 파라볼릭SAR 신호 계산"""
+    try:
+        data = _fetch_ohlcv(ticker, range_="1y")
+        if not data:
             return {"signal": 0, "price": None}
 
-        res    = result[0]
-        ts     = res.get("timestamp", [])
-        ohlcv  = res.get("indicators", {}).get("quote", [{}])[0]
+        ts, ohlcv = data
         closes = ohlcv.get("close", [])
         opens  = ohlcv.get("open",  [])
         highs  = ohlcv.get("high",  [])
@@ -69,12 +107,12 @@ def _get_signal(ticker: str) -> dict:
         price  = float(last["close"])
 
         return {
-            "signal":    signal,
-            "price":     price,
-            "sar":       float(last["sar"]) if pd.notna(last.get("sar")) else None,
-            "rsi":       float(last["rsi"]) if pd.notna(last.get("rsi")) else None,
+            "signal": signal,
+            "price":  price,
+            "sar":    float(last["sar"]) if pd.notna(last.get("sar")) else None,
+            "rsi":    float(last["rsi"]) if pd.notna(last.get("rsi")) else None,
         }
-    except Exception as e:
+    except Exception:
         return {"signal": 0, "price": None}
 
 

@@ -63,6 +63,95 @@ def _av(params: dict) -> dict:
         return {}
 
 
+def _yf_chart_plain(symbol: str, months: int = 6) -> list[dict]:
+    """Yahoo Finance v8 query2 — 일반 httpx, curl_cffi 없이도 동작 (Render IP 우회)"""
+    try:
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept":          "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer":         "https://finance.yahoo.com/",
+        }
+        r = httpx.get(
+            url,
+            params={"interval": "1d", "range": f"{months}mo"},
+            headers=headers,
+            timeout=15,
+            follow_redirects=True,
+        )
+        r.raise_for_status()
+        result = r.json().get("chart", {}).get("result", [])
+        if not result:
+            return []
+        res    = result[0]
+        ts     = res.get("timestamp", [])
+        ohlcv  = res.get("indicators", {}).get("quote", [{}])[0]
+        chart  = []
+        for i, t in enumerate(ts):
+            try:
+                chart.append({
+                    "date":   datetime.fromtimestamp(t).strftime("%Y-%m-%d"),
+                    "open":   round(float(ohlcv["open"][i]),   2),
+                    "high":   round(float(ohlcv["high"][i]),   2),
+                    "low":    round(float(ohlcv["low"][i]),    2),
+                    "close":  round(float(ohlcv["close"][i]),  2),
+                    "volume": int(ohlcv["volume"][i] or 0),
+                })
+            except Exception:
+                continue
+        return chart
+    except Exception:
+        return []
+
+
+def _fh_candle(symbol: str, months: int = 6) -> list[dict]:
+    """Finnhub /stock/candle — 기존 Finnhub 키 활용, 서버 IP 차단 없음, Yahoo 차단 시 폴백"""
+    try:
+        import time
+        from datetime import timedelta
+        now   = int(time.time())
+        start = int((datetime.today() - timedelta(days=months * 31 + 10)).timestamp())
+        params = {
+            "symbol":     symbol,
+            "resolution": "D",
+            "from":       start,
+            "to":         now,
+            "token":      FINNHUB_KEY,
+        }
+        r = httpx.get(f"{FINNHUB_BASE}/stock/candle", params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("s") != "ok" or not data.get("t"):
+            return []
+        ts  = data["t"]
+        os_ = data.get("o", [])
+        hs  = data.get("h", [])
+        ls  = data.get("l", [])
+        cs  = data.get("c", [])
+        vs  = data.get("v", [])
+        chart = []
+        for i, t in enumerate(ts):
+            try:
+                chart.append({
+                    "date":   datetime.fromtimestamp(t).strftime("%Y-%m-%d"),
+                    "open":   round(float(os_[i]), 2),
+                    "high":   round(float(hs[i]),  2),
+                    "low":    round(float(ls[i]),  2),
+                    "close":  round(float(cs[i]),  2),
+                    "volume": int(vs[i] or 0) if i < len(vs) else 0,
+                })
+            except Exception:
+                continue
+        return sorted(chart, key=lambda x: x["date"])
+    except Exception:
+        return []
+
+
 def _yf_chart(symbol: str, months: int = 6) -> list[dict]:
     """Yahoo Finance v8 차트 API — curl_cffi로 IP 차단 우회, API 키 불필요"""
     try:
@@ -137,8 +226,10 @@ def _get_us_stock(ticker: str) -> dict:
     m = metrics_raw.get("metric", {})
     rec = _fh("/stock/price-target", symbol=ticker)
 
-    # 차트: Yahoo v8(curl_cffi, 무제한) → 실패 시 Alpha Vantage 폴백
+    # 차트: query1(curl_cffi) → query2(httpx) → Alpha Vantage 순서로 폴백
     chart_data = _yf_chart(ticker, months=6)
+    if not chart_data:
+        chart_data = _yf_chart_plain(ticker, months=6)
     series = {}  # MA 계산용 (AV 폴백 시 채워짐)
     if not chart_data:
         av_resp = _av({"function": "TIME_SERIES_DAILY", "symbol": ticker, "outputsize": "full"})
@@ -161,6 +252,8 @@ def _get_us_stock(ticker: str) -> dict:
     ma_50 = ma_200 = None
     try:
         long_chart = _yf_chart(ticker, months=14)  # ~290 거래일 → 200일 MA 충분
+        if not long_chart:
+            long_chart = _yf_chart_plain(ticker, months=14)
         if long_chart:
             long_closes = [d["close"] for d in long_chart]
             if len(long_closes) >= 50:

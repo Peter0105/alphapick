@@ -136,7 +136,23 @@ function renderAnalysis({ stock_data: s, analysis: a, from_cache }) {
 
 function renderChart(chartData) {
   const el = document.getElementById('chart');
+
+  // 기존 인스턴스 재사용 (중복 init 방지)
+  const existing = echarts.getInstanceByDom(el);
+  if (existing) existing.dispose();
   const chart = echarts.init(el, 'dark');
+
+  if (!chartData || chartData.length === 0) {
+    chart.setOption({
+      backgroundColor: 'transparent',
+      graphic: [{
+        type: 'text',
+        left: 'center', top: 'middle',
+        style: { text: '차트 데이터 없음', fill: '#6b7a99', fontSize: 16 },
+      }],
+    });
+    return;
+  }
 
   const dates = chartData.map(d => d.date);
   const ohlc  = chartData.map(d => [d.open, d.close, d.low, d.high]);
