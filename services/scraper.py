@@ -39,31 +39,32 @@ def _get(params: dict, retries: int = 3) -> dict:
 
 def get_stock_data(ticker: str) -> dict:
     normalized = normalize_ticker(ticker)
-
-    # Alpha Vantage는 .KS 미지원 → 6자리 원본 코드 사용
     av_symbol = normalized.replace(".KS", "").replace(".KQ", "")
 
-    # ── 1. 기본 정보 (OVERVIEW) ────────────────────────────
+    # ── 1. 기본 정보 + 현재가 (OVERVIEW) ──────────────────
     overview = _get({"function": "OVERVIEW", "symbol": av_symbol})
     if not overview or overview.get("Symbol") is None:
         raise ValueError(f"종목을 찾을 수 없습니다: {av_symbol}")
 
+    time.sleep(13)  # 분당 5회 제한 → 호출 간 13초 간격
+
     # ── 2. 현재가 (GLOBAL_QUOTE) ───────────────────────────
     quote_data = _get({"function": "GLOBAL_QUOTE", "symbol": av_symbol})
     q = quote_data.get("Global Quote", {})
-
     current_price = float(q.get("05. price", 0) or 0) or None
 
-    # ── 3. 가격 히스토리 (일봉 6개월) ──────────────────────
+    time.sleep(13)
+
+    # ── 3. 가격 히스토리 ───────────────────────────────────
     chart_data = []
     try:
         hist = _get({
             "function": "TIME_SERIES_DAILY",
             "symbol": av_symbol,
-            "outputsize": "compact",   # 최근 100일
+            "outputsize": "compact",
         })
         series = hist.get("Time Series (Daily)", {})
-        for date_str in sorted(series.keys())[-126:]:  # ~6개월
+        for date_str in sorted(series.keys())[-100:]:
             d = series[date_str]
             chart_data.append({
                 "date":   date_str,
@@ -75,6 +76,8 @@ def get_stock_data(ticker: str) -> dict:
             })
     except Exception:
         pass
+
+    time.sleep(13)
 
     # ── 4. 뉴스 ────────────────────────────────────────────
     news = []

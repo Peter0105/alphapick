@@ -17,7 +17,7 @@ def load_portfolio() -> dict:
 
 
 def save_portfolio(portfolio: dict):
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(str(_ROOT / "data"), exist_ok=True)
     with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
         json.dump(portfolio, f, ensure_ascii=False, indent=2)
 
