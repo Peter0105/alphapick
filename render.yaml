@@ -7,3 +7,7 @@ services:
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
+      - key: FINNHUB_KEY
+        sync: false
+      - key: ALPHA_VANTAGE_KEY
+        sync: false
