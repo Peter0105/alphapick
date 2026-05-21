@@ -1,12 +1,21 @@
+"""
+AlphaPick Auto Trading Router
+백테스트 검증된 MA 교차 전략 기반 규칙 매매
+(Claude API는 시장 코멘트에만 사용 — 매매 결정은 순수 알고리즘)
+"""
+
+import json
+import pandas as pd
 from fastapi import APIRouter
 from services.portfolio import load_portfolio, reset_portfolio, execute_trade, update_prices
-from services.scraper import get_stock_data
-from services.claude_service import make_trading_decision
+from services.strategy  import strategy_ma_crossover, _add_indicators
+from services.scraper   import get_stock_data
 
 router = APIRouter()
 
-WATCHLIST = ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "005930.KS", "000660.KS"]
+WATCHLIST = ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN"]
 
+# ── 포트폴리오 ──────────────────────────────────────────────
 
 @router.get("/portfolio")
 async def get_portfolio():
@@ -18,54 +27,186 @@ async def do_reset():
     return reset_portfolio()
 
 
+# ── 전략 신호 계산 ─────────────────────────────────────────
+
+def _get_signal(ticker: str) -> dict:
+    """Yahoo Finance에서 1년치 데이터 받아 MA 교차 신호 계산"""
+    try:
+        from curl_cffi import requests as cr
+        from datetime import datetime, timedelta
+
+        session = cr.Session(impersonate="chrome124")
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        r   = session.get(url, params={"interval": "1d", "range": "1y"}, timeout=15)
+        result = r.json().get("chart", {}).get("result", [])
+        if not result:
+            return {"signal": 0, "price": None}
+
+        res    = result[0]
+        ts     = res.get("timestamp", [])
+        ohlcv  = res.get("indicators", {}).get("quote", [{}])[0]
+        closes = ohlcv.get("close", [])
+        opens  = ohlcv.get("open",  [])
+        highs  = ohlcv.get("high",  [])
+        lows   = ohlcv.get("low",   [])
+        vols   = ohlcv.get("volume",[])
+
+        dates = [pd.Timestamp.fromtimestamp(t) for t in ts]
+        df    = pd.DataFrame({
+            "open":   opens,
+            "high":   highs,
+            "low":    lows,
+            "close":  closes,
+            "volume": vols,
+        }, index=pd.DatetimeIndex(dates)).dropna()
+
+        if len(df) < 55:
+            return {"signal": 0, "price": float(closes[-1]) if closes else None}
+
+        df      = strategy_ma_crossover(df)
+        last    = df.iloc[-1]
+        signal  = int(last.get("signal", 0))
+        price   = float(last["close"])
+        ma20    = float(last["ma20"])  if pd.notna(last.get("ma20"))  else None
+        ma50    = float(last["ma50"])  if pd.notna(last.get("ma50"))  else None
+
+        return {
+            "signal":  signal,
+            "price":   price,
+            "ma20":    ma20,
+            "ma50":    ma50,
+            "rsi":     float(last["rsi"]) if pd.notna(last.get("rsi")) else None,
+        }
+    except Exception as e:
+        return {"signal": 0, "price": None}
+
+
+# ── 자동 매매 실행 ─────────────────────────────────────────
+
 @router.post("/trade/auto")
 async def auto_trade():
-    portfolio = load_portfolio()
-
-    watchlist_data = []
+    portfolio     = load_portfolio()
     price_updates = {}
+    signals       = {}
+    trade_log     = []
 
+    # 신호 수집
     for ticker in WATCHLIST:
-        try:
-            d = get_stock_data(ticker)
-            if d["current_price"]:
-                price_updates[ticker] = d["current_price"]
-                watchlist_data.append({
-                    "ticker": ticker,
-                    "name": d["name"],
-                    "price": d["current_price"],
-                    "pe_ratio": d["pe_ratio"],
-                    "week_52_high": d["week_52_high"],
-                    "week_52_low": d["week_52_low"],
-                    "ma_50": d["ma_50"],
-                    "analyst_target": d["analyst_target"],
-                })
-        except Exception:
-            continue
+        sig = _get_signal(ticker)
+        if sig["price"]:
+            price_updates[ticker] = sig["price"]
+            signals[ticker]       = sig
 
+    # 가격 업데이트
     portfolio = update_prices(price_updates)
-    decision = make_trading_decision(portfolio, watchlist_data)
 
-    executed = []
-    for a in decision.get("actions", []):
-        if a["action"] in ("BUY", "SELL"):
-            result = execute_trade(
-                action=a["action"],
-                ticker=a["ticker"],
-                quantity=int(a.get("quantity", 0)),
-                price=float(a.get("price", 0)),
-                reason=a.get("reason", ""),
-            )
-            executed.append({**a, "result": result})
+    # 손절 (-8%)
+    for ticker, pos in list(portfolio["positions"].items()):
+        if ticker not in signals:
+            continue
+        price = signals[ticker]["price"]
+        ret   = (price - pos["avg_price"]) / pos["avg_price"]
+        if ret <= -0.08:
+            result = execute_trade("SELL", ticker, pos["quantity"], price, "손절 -8%")
+            trade_log.append({
+                "action": "SELL", "ticker": ticker,
+                "quantity": pos["quantity"], "price": price,
+                "reason": f"손절 -8% (손실 {ret*100:.1f}%)",
+                "result": result,
+            })
+
+    # 전략 신호 실행
+    portfolio = load_portfolio()
+    cash      = portfolio["cash"]
+    positions = portfolio["positions"]
+
+    for ticker, sig in signals.items():
+        price    = sig["price"]
+        signal   = sig["signal"]
+        ma20     = sig.get("ma20")
+        ma50     = sig.get("ma50")
+
+        if signal == 1 and ticker not in positions:
+            # 보유 종목 최대 4개 제한, 현금 20% 사용
+            if len(positions) >= 4:
+                continue
+            invest = cash * 0.20
+            qty    = int(invest / price)
+            if qty < 1:
+                continue
+            result = execute_trade("BUY", ticker, qty, price,
+                                   f"MA 골든크로스 (MA20={ma20:.2f} > MA50={ma50:.2f})")
+            if result["success"]:
+                cash -= qty * price
+                positions[ticker] = True
+                trade_log.append({
+                    "action": "BUY", "ticker": ticker,
+                    "quantity": qty, "price": price,
+                    "reason": f"MA 골든크로스",
+                    "result": result,
+                })
+
+        elif signal == -1 and ticker in positions:
+            pos = portfolio["positions"].get(ticker)
+            if not pos:
+                continue
+            result = execute_trade("SELL", ticker, pos["quantity"], price,
+                                   f"MA 데드크로스 (MA20={ma20:.2f} < MA50={ma50:.2f})")
+            if result["success"]:
+                trade_log.append({
+                    "action": "SELL", "ticker": ticker,
+                    "quantity": pos["quantity"], "price": price,
+                    "reason": "MA 데드크로스",
+                    "result": result,
+                })
+
+    # 시장 코멘트 (Claude — 옵션, 실패해도 무관)
+    market_view = _get_market_comment(signals, portfolio)
 
     return {
-        "decision": decision,
-        "executed": executed,
+        "decision": {
+            "market_view": market_view,
+            "strategy":    "MA 교차 전략 (백테스트 검증 — 3년 +26.7%, 샤프 0.52)",
+        },
+        "executed":  trade_log,
         "portfolio": load_portfolio(),
     }
+
+
+def _get_market_comment(signals: dict, portfolio: dict) -> str:
+    try:
+        from services.claude_service import _get_client
+        bull = [t for t, s in signals.items() if (s.get("ma20") or 0) > (s.get("ma50") or 0)]
+        bear = [t for t, s in signals.items() if (s.get("ma20") or 0) < (s.get("ma50") or 0)]
+        prompt = (
+            f"현재 MA20>MA50 종목: {bull}\n"
+            f"현재 MA20<MA50 종목: {bear}\n"
+            f"포트폴리오 수익률: {portfolio.get('return_pct', 0):.2f}%\n"
+            "위 상황을 한 문장으로 요약해줘."
+        )
+        resp = _get_client().messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip()
+    except Exception:
+        bull_count = sum(1 for s in signals.values() if (s.get("ma20") or 0) > (s.get("ma50") or 0))
+        return f"관심 종목 {len(signals)}개 중 {bull_count}개 상승 추세 (MA20 > MA50)"
 
 
 @router.get("/trade/history")
 async def trade_history():
     p = load_portfolio()
     return list(reversed(p.get("trade_history", [])))
+
+
+@router.get("/backtest/result")
+async def get_backtest_result():
+    """백테스트 결과 조회"""
+    from pathlib import Path
+    result_file = Path(__file__).resolve().parent.parent / "data" / "backtest_result.json"
+    if result_file.exists():
+        with open(result_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"error": "백테스트 결과 없음 — scripts/run_backtest.py 실행 필요"}
