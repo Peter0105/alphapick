@@ -1,109 +1,129 @@
-import httpx
-import os
 import time
-from pathlib import Path
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", override=True)
+# curl_cffi로 Chrome 흉내 → Yahoo Finance IP 차단 우회
+try:
+    from curl_cffi import requests as curl_requests
+    _SESSION = curl_requests.Session(impersonate="chrome110")
+except Exception:
+    _SESSION = None
 
-AV_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
-AV_BASE = "https://www.alphavantage.co/query"
+import yfinance as yf
 
 
 def normalize_ticker(ticker: str) -> str:
     ticker = ticker.strip().upper().replace(" ", "")
+    # 6자리 숫자면 한국 주식 (KRX)
     if ticker.isdigit() and len(ticker) == 6:
         return f"{ticker}.KS"
     return ticker
 
 
-def _get(params: dict, retries: int = 3) -> dict:
-    params["apikey"] = AV_KEY
-    for attempt in range(retries):
-        try:
-            with httpx.Client(timeout=20) as client:
-                r = client.get(AV_BASE, params=params)
-                r.raise_for_status()
-                data = r.json()
-                if "Note" in data or "Information" in data:
-                    raise RuntimeError("API 한도 초과 — 잠시 후 다시 시도하세요")
-                return data
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(3)
-            else:
-                raise e
-    return {}
-
-
 def get_stock_data(ticker: str) -> dict:
     normalized = normalize_ticker(ticker)
-    av_symbol = normalized.replace(".KS", "").replace(".KQ", "")
 
-    # ── 호출 1: OVERVIEW (펀더멘털 전체) ──────────────────
-    overview = _get({"function": "OVERVIEW", "symbol": av_symbol})
-    if not overview or not overview.get("Symbol"):
-        raise ValueError(f"종목을 찾을 수 없습니다: {av_symbol}")
+    # yfinance Ticker 객체 — curl_cffi 세션 주입으로 차단 우회
+    if _SESSION:
+        t = yf.Ticker(normalized, session=_SESSION)
+    else:
+        t = yf.Ticker(normalized)
 
-    time.sleep(15)  # 분당 5회 제한 — 15초 간격
-
-    # ── 호출 2: 일봉 차트 + 현재가 ────────────────────────
-    chart_data = []
-    current_price = None
+    # ── 1. 기본 정보 (info) ───────────────────────────────
     try:
-        hist = _get({
-            "function": "TIME_SERIES_DAILY",
-            "symbol": av_symbol,
-            "outputsize": "compact",  # 최근 100일
-        })
-        series = hist.get("Time Series (Daily)", {})
-        sorted_dates = sorted(series.keys())
-        for date_str in sorted_dates[-100:]:
-            d = series[date_str]
+        info = t.fast_info  # 빠른 버전 (가격 위주)
+        full_info = t.info  # 전체 (섹터, PE, EPS 등)
+    except Exception as e:
+        raise ValueError(f"종목을 찾을 수 없습니다: {normalized} ({e})")
+
+    if not full_info or full_info.get("quoteType") is None:
+        raise ValueError(f"종목을 찾을 수 없습니다: {normalized}")
+
+    # 현재가
+    current_price = (
+        full_info.get("currentPrice")
+        or full_info.get("regularMarketPrice")
+        or full_info.get("previousClose")
+    )
+
+    # 애널리스트 목표가
+    analyst_target = full_info.get("targetMeanPrice")
+    analyst_low    = full_info.get("targetLowPrice")
+    analyst_high   = full_info.get("targetHighPrice")
+
+    # ── 2. 뉴스 ──────────────────────────────────────────
+    news_items = []
+    try:
+        raw_news = t.news or []
+        for n in raw_news[:8]:
+            content = n.get("content", {})
+            title = (
+                content.get("title")
+                or n.get("title", "")
+            )
+            # 링크: canonicalUrl > clickThroughUrl > 직접 link
+            link = (
+                (content.get("canonicalUrl") or {}).get("url")
+                or (content.get("clickThroughUrl") or {}).get("url")
+                or n.get("link", "#")
+            )
+            if title:
+                news_items.append({"title": title, "link": link})
+    except Exception:
+        pass
+
+    # ── 3. 차트 데이터 (최근 6개월 일봉) ─────────────────
+    chart_data = []
+    try:
+        end   = datetime.today()
+        start = end - timedelta(days=180)
+        hist  = t.history(start=start.strftime("%Y-%m-%d"),
+                          end=end.strftime("%Y-%m-%d"),
+                          interval="1d")
+        for date_idx, row in hist.iterrows():
             chart_data.append({
-                "date":   date_str,
-                "open":   round(float(d["1. open"]), 2),
-                "high":   round(float(d["2. high"]), 2),
-                "low":    round(float(d["3. low"]), 2),
-                "close":  round(float(d["4. close"]), 2),
-                "volume": int(d["5. volume"]),
+                "date":   date_idx.strftime("%Y-%m-%d"),
+                "open":   round(float(row["Open"]),   2),
+                "high":   round(float(row["High"]),   2),
+                "low":    round(float(row["Low"]),    2),
+                "close":  round(float(row["Close"]),  2),
+                "volume": int(row["Volume"]),
             })
-        # 가장 최근 종가 = 현재가
-        if sorted_dates:
-            current_price = float(series[sorted_dates[-1]]["4. close"])
+        # 차트에서 가져온 최신 종가로 현재가 보완
+        if not current_price and chart_data:
+            current_price = chart_data[-1]["close"]
     except Exception:
         pass
 
     def flt(val):
         try:
-            return float(val) if val and val not in ("None", "-") else None
+            return float(val) if val is not None else None
         except Exception:
             return None
 
     return {
         "ticker":         normalized,
-        "name":           overview.get("Name", av_symbol),
-        "current_price":  current_price,
-        "currency":       overview.get("Currency", "USD"),
-        "market_cap":     flt(overview.get("MarketCapitalization")),
-        "pe_ratio":       flt(overview.get("PERatio")),
-        "forward_pe":     flt(overview.get("ForwardPE")),
-        "eps":            flt(overview.get("EPS")),
-        "revenue":        flt(overview.get("RevenueTTM")),
-        "profit_margin":  flt(overview.get("ProfitMargin")),
-        "week_52_high":   flt(overview.get("52WeekHigh")),
-        "week_52_low":    flt(overview.get("52WeekLow")),
-        "ma_50":          flt(overview.get("50DayMovingAverage")),
-        "ma_200":         flt(overview.get("200DayMovingAverage")),
-        "beta":           flt(overview.get("Beta")),
-        "dividend_yield": flt(overview.get("DividendYield")),
-        "volume":         None,
-        "avg_volume":     None,
-        "sector":         overview.get("Sector"),
-        "industry":       overview.get("Industry"),
-        "analyst_target": flt(overview.get("AnalystTargetPrice")),
-        "analyst_low":    None,
-        "analyst_high":   None,
-        "news":           [],  # API 호출 절약 — 뉴스 제거
+        "name":           full_info.get("longName") or full_info.get("shortName") or normalized,
+        "current_price":  flt(current_price),
+        "currency":       full_info.get("currency", "USD"),
+        "market_cap":     flt(full_info.get("marketCap")),
+        "pe_ratio":       flt(full_info.get("trailingPE")),
+        "forward_pe":     flt(full_info.get("forwardPE")),
+        "eps":            flt(full_info.get("trailingEps")),
+        "revenue":        flt(full_info.get("totalRevenue")),
+        "profit_margin":  flt(full_info.get("profitMargins")),
+        "week_52_high":   flt(full_info.get("fiftyTwoWeekHigh")),
+        "week_52_low":    flt(full_info.get("fiftyTwoWeekLow")),
+        "ma_50":          flt(full_info.get("fiftyDayAverage")),
+        "ma_200":         flt(full_info.get("twoHundredDayAverage")),
+        "beta":           flt(full_info.get("beta")),
+        "dividend_yield": flt(full_info.get("dividendYield")),
+        "volume":         flt(full_info.get("volume")),
+        "avg_volume":     flt(full_info.get("averageVolume")),
+        "sector":         full_info.get("sector"),
+        "industry":       full_info.get("industry"),
+        "analyst_target": flt(analyst_target),
+        "analyst_low":    flt(analyst_low),
+        "analyst_high":   flt(analyst_high),
+        "news":           news_items,
         "chart_data":     chart_data,
     }
