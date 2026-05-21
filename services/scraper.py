@@ -1,87 +1,124 @@
-import yfinance as yf
+import httpx
+import os
 import time
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", override=True)
+
+AV_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
+AV_BASE = "https://www.alphavantage.co/query"
 
 
 def normalize_ticker(ticker: str) -> str:
     ticker = ticker.strip().upper().replace(" ", "")
+    # 6자리 숫자 → 한국 주식
     if ticker.isdigit() and len(ticker) == 6:
         return f"{ticker}.KS"
     return ticker
 
 
-def get_stock_data(ticker: str, retries: int = 3) -> dict:
-    normalized = normalize_ticker(ticker)
-
-    last_err = None
+def _get(params: dict, retries: int = 3) -> dict:
+    params["apikey"] = AV_KEY
     for attempt in range(retries):
         try:
-            # yfinance 1.3+ : session 직접 넘기지 않음 (curl_cffi 내부 사용)
-            stock = yf.Ticker(normalized)
-            info = stock.info
-
-            if not info or not info.get("shortName"):
-                raise ValueError("종목 정보를 찾을 수 없습니다")
-
-            hist = stock.history(period="6mo")
-
-            try:
-                news = [
-                    {"title": n.get("title", ""), "link": n.get("link", "")}
-                    for n in (stock.news or [])[:5]
-                ]
-            except Exception:
-                news = []
-
-            chart_data = []
-            if not hist.empty:
-                for dt, row in hist.iterrows():
-                    chart_data.append({
-                        "date": dt.strftime("%Y-%m-%d"),
-                        "open": round(float(row["Open"]), 2),
-                        "high": round(float(row["High"]), 2),
-                        "low": round(float(row["Low"]), 2),
-                        "close": round(float(row["Close"]), 2),
-                        "volume": int(row["Volume"]),
-                    })
-
-            current_price = (
-                info.get("currentPrice")
-                or info.get("regularMarketPrice")
-                or (float(hist["Close"].iloc[-1]) if not hist.empty else None)
-            )
-
-            return {
-                "ticker": normalized,
-                "name": info.get("longName") or info.get("shortName", ticker),
-                "current_price": current_price,
-                "currency": info.get("currency", "USD"),
-                "market_cap": info.get("marketCap"),
-                "pe_ratio": info.get("trailingPE"),
-                "forward_pe": info.get("forwardPE"),
-                "eps": info.get("trailingEps"),
-                "revenue": info.get("totalRevenue"),
-                "profit_margin": info.get("profitMargins"),
-                "week_52_high": info.get("fiftyTwoWeekHigh"),
-                "week_52_low": info.get("fiftyTwoWeekLow"),
-                "ma_50": info.get("fiftyDayAverage"),
-                "ma_200": info.get("twoHundredDayAverage"),
-                "beta": info.get("beta"),
-                "dividend_yield": info.get("dividendYield"),
-                "volume": info.get("volume"),
-                "avg_volume": info.get("averageVolume"),
-                "sector": info.get("sector"),
-                "industry": info.get("industry"),
-                "analyst_target": info.get("targetMeanPrice"),
-                "analyst_low": info.get("targetLowPrice"),
-                "analyst_high": info.get("targetHighPrice"),
-                "news": news,
-                "chart_data": chart_data,
-            }
-
+            with httpx.Client(timeout=20) as client:
+                r = client.get(AV_BASE, params=params)
+                r.raise_for_status()
+                data = r.json()
+                if "Note" in data or "Information" in data:
+                    raise RuntimeError("API 한도 초과 — 잠시 후 다시 시도하세요")
+                return data
         except Exception as e:
-            last_err = e
             if attempt < retries - 1:
                 time.sleep(2)
-            continue
+            else:
+                raise e
+    return {}
 
-    raise RuntimeError(f"데이터 수집 실패 ({retries}회 시도): {last_err}")
+
+def get_stock_data(ticker: str) -> dict:
+    normalized = normalize_ticker(ticker)
+
+    # Alpha Vantage는 .KS 미지원 → 6자리 원본 코드 사용
+    av_symbol = normalized.replace(".KS", "").replace(".KQ", "")
+
+    # ── 1. 기본 정보 (OVERVIEW) ────────────────────────────
+    overview = _get({"function": "OVERVIEW", "symbol": av_symbol})
+    if not overview or overview.get("Symbol") is None:
+        raise ValueError(f"종목을 찾을 수 없습니다: {av_symbol}")
+
+    # ── 2. 현재가 (GLOBAL_QUOTE) ───────────────────────────
+    quote_data = _get({"function": "GLOBAL_QUOTE", "symbol": av_symbol})
+    q = quote_data.get("Global Quote", {})
+
+    current_price = float(q.get("05. price", 0) or 0) or None
+
+    # ── 3. 가격 히스토리 (일봉 6개월) ──────────────────────
+    chart_data = []
+    try:
+        hist = _get({
+            "function": "TIME_SERIES_DAILY",
+            "symbol": av_symbol,
+            "outputsize": "compact",   # 최근 100일
+        })
+        series = hist.get("Time Series (Daily)", {})
+        for date_str in sorted(series.keys())[-126:]:  # ~6개월
+            d = series[date_str]
+            chart_data.append({
+                "date":   date_str,
+                "open":   round(float(d["1. open"]), 2),
+                "high":   round(float(d["2. high"]), 2),
+                "low":    round(float(d["3. low"]), 2),
+                "close":  round(float(d["4. close"]), 2),
+                "volume": int(d["5. volume"]),
+            })
+    except Exception:
+        pass
+
+    # ── 4. 뉴스 ────────────────────────────────────────────
+    news = []
+    try:
+        news_data = _get({
+            "function": "NEWS_SENTIMENT",
+            "tickers": av_symbol,
+            "limit": "5",
+        })
+        for item in news_data.get("feed", [])[:5]:
+            news.append({"title": item.get("title", ""), "link": item.get("url", "")})
+    except Exception:
+        pass
+
+    def flt(val):
+        try:
+            return float(val) if val and val != "None" else None
+        except Exception:
+            return None
+
+    return {
+        "ticker":         normalized,
+        "name":           overview.get("Name", av_symbol),
+        "current_price":  current_price,
+        "currency":       overview.get("Currency", "USD"),
+        "market_cap":     flt(overview.get("MarketCapitalization")),
+        "pe_ratio":       flt(overview.get("PERatio")),
+        "forward_pe":     flt(overview.get("ForwardPE")),
+        "eps":            flt(overview.get("EPS")),
+        "revenue":        flt(overview.get("RevenueTTM")),
+        "profit_margin":  flt(overview.get("ProfitMargin")),
+        "week_52_high":   flt(overview.get("52WeekHigh")),
+        "week_52_low":    flt(overview.get("52WeekLow")),
+        "ma_50":          flt(overview.get("50DayMovingAverage")),
+        "ma_200":         flt(overview.get("200DayMovingAverage")),
+        "beta":           flt(overview.get("Beta")),
+        "dividend_yield": flt(overview.get("DividendYield")),
+        "volume":         int(q.get("06. volume", 0) or 0) or None,
+        "avg_volume":     None,
+        "sector":         overview.get("Sector"),
+        "industry":       overview.get("Industry"),
+        "analyst_target": flt(overview.get("AnalystTargetPrice")),
+        "analyst_low":    None,
+        "analyst_high":   None,
+        "news":           news,
+        "chart_data":     chart_data,
+    }
