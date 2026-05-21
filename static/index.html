@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AlphaPick — AI 주식 분석</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+<header>
+  <div class="logo">Alpha<span>Pick</span></div>
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('analysis')">📊 주식 분석</button>
+    <button class="tab" onclick="switchTab('trading')">🤖 모의 트레이딩</button>
+  </div>
+</header>
+
+<!-- ══════════════ TAB 1: 분석 ══════════════ -->
+<div id="tab-analysis" class="tab-content active">
+  <div class="search-wrap">
+    <div class="search-box">
+      <input id="tickerInput" type="text" placeholder="티커 또는 종목코드 입력  (예: AAPL, TSLA, 005930)" />
+      <button onclick="runAnalysis()">분석하기</button>
+    </div>
+    <div class="search-hints">
+      <span onclick="quickSearch('AAPL')">AAPL</span>
+      <span onclick="quickSearch('TSLA')">TSLA</span>
+      <span onclick="quickSearch('NVDA')">NVDA</span>
+      <span onclick="quickSearch('MSFT')">MSFT</span>
+      <span onclick="quickSearch('005930')">삼성전자</span>
+      <span onclick="quickSearch('000660')">SK하이닉스</span>
+    </div>
+  </div>
+
+  <div id="loading" class="loading hidden">
+    <div class="spinner"></div>
+    <p>Claude가 분석 중입니다...</p>
+  </div>
+
+  <div id="analysis-result" class="hidden">
+
+    <!-- 종목 헤더 -->
+    <div class="card stock-header">
+      <div class="stock-info">
+        <div>
+          <h2 id="stockName">—</h2>
+          <span id="stockTicker" class="ticker-badge">—</span>
+          <span id="cacheTag" class="cache-tag hidden">캐시</span>
+        </div>
+        <div class="price-block">
+          <div id="currentPrice" class="price">—</div>
+          <div id="currency" class="currency">—</div>
+        </div>
+      </div>
+      <div class="verdict-block">
+        <div id="verdictBadge" class="verdict-badge">—</div>
+        <div class="confidence-wrap">
+          <span>신뢰도</span>
+          <div class="confidence-bar"><div id="confidenceBar"></div></div>
+          <span id="confidenceVal">—</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 요약 + 적정가 -->
+    <div class="grid-2">
+      <div class="card">
+        <h3>📝 핵심 요약</h3>
+        <p id="summary" class="summary-text">—</p>
+        <div class="sentiment-row">
+          <span>뉴스 센티멘트</span>
+          <span id="newsSentiment" class="sentiment-badge">—</span>
+        </div>
+        <p id="newsSummary" class="news-summary-text">—</p>
+      </div>
+      <div class="card">
+        <h3>🎯 적정가 분석</h3>
+        <div class="price-range">
+          <div class="range-item">
+            <div class="range-label">적정가 범위</div>
+            <div class="range-value"><span id="fairLow">—</span> ~ <span id="fairHigh">—</span></div>
+          </div>
+          <div class="range-item">
+            <div class="range-label">목표가</div>
+            <div id="targetPrice" class="range-value big">—</div>
+          </div>
+          <div class="range-item">
+            <div class="range-label">상승 여력</div>
+            <div id="upsidePct" class="range-value upside">—</div>
+          </div>
+          <div class="range-item">
+            <div class="range-label">애널리스트 목표가</div>
+            <div id="analystTarget" class="range-value">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 불/베어 케이스 -->
+    <div class="grid-2">
+      <div class="card bull-card">
+        <h3>🟢 매수 근거</h3>
+        <ul id="bullCase"></ul>
+      </div>
+      <div class="card bear-card">
+        <h3>🔴 리스크</h3>
+        <ul id="bearCase"></ul>
+      </div>
+    </div>
+
+    <!-- 밸류 + 기술적 -->
+    <div class="grid-2">
+      <div class="card">
+        <h3>💹 밸류에이션 분석</h3>
+        <p id="valuationAnalysis" class="analysis-text">—</p>
+      </div>
+      <div class="card">
+        <h3>📈 기술적 분석</h3>
+        <p id="technicalAnalysis" class="analysis-text">—</p>
+      </div>
+    </div>
+
+    <!-- 주요 지표 -->
+    <div class="card">
+      <h3>📊 주요 지표</h3>
+      <div class="metrics-grid" id="metricsGrid"></div>
+    </div>
+
+    <!-- 차트 -->
+    <div class="card">
+      <h3>📉 가격 차트 (6개월)</h3>
+      <div id="chart" style="height:400px;"></div>
+    </div>
+
+    <!-- 뉴스 -->
+    <div class="card" id="newsCard">
+      <h3>📰 최신 뉴스</h3>
+      <ul id="newsList" class="news-list"></ul>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════ TAB 2: 모의 트레이딩 ══════════════ -->
+<div id="tab-trading" class="tab-content hidden">
+
+  <div class="portfolio-header">
+    <div class="port-stat-wrap" id="portStats"></div>
+    <div class="port-actions">
+      <button class="btn-auto" onclick="runAutoTrade()" id="autoBtn">🤖 Claude 자동매매 실행</button>
+      <button class="btn-reset" onclick="resetPortfolio()">↺ 초기화</button>
+    </div>
+  </div>
+
+  <div id="trade-loading" class="loading hidden">
+    <div class="spinner"></div>
+    <p>Claude가 시장을 분석하고 매매를 결정 중입니다...</p>
+  </div>
+
+  <div id="last-decision" class="card hidden">
+    <h3>🧠 Claude 최근 결정</h3>
+    <p id="marketView" class="analysis-text">—</p>
+    <p id="strategyView" class="analysis-text" style="color:#aaa">—</p>
+    <div id="executedTrades"></div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h3>💼 보유 종목</h3>
+      <table class="data-table" id="positionTable">
+        <thead><tr><th>종목</th><th>수량</th><th>평균단가</th><th>현재가</th><th>손익</th></tr></thead>
+        <tbody id="positionBody"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>📋 매매 내역</h3>
+      <table class="data-table" id="historyTable">
+        <thead><tr><th>시각</th><th>종목</th><th>매매</th><th>수량</th><th>가격</th></tr></thead>
+        <tbody id="historyBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
